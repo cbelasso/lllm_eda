@@ -10,6 +10,7 @@ from eda_pipeline_optimized import (
     inspect_live_results,
     load_dataframe,
 )
+from prompts import get_default_backend
 
 # Model mapping
 MODEL_MAPPING = {
@@ -17,13 +18,13 @@ MODEL_MAPPING = {
 }
 
 
-def load_config(config_path: str = "config.yaml") -> dict:
+def load_config(config_path: str = "config.yaml", skip_llm_mapping: bool = False) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    # Map model string to actual object
-    if "processor" in config and "llm" in config["processor"]:
+    # Map model string to actual object (unless skipping)
+    if not skip_llm_mapping and "processor" in config and "llm" in config["processor"]:
         model_name = config["processor"]["llm"]
         if model_name in MODEL_MAPPING:
             config["processor"]["llm"] = MODEL_MAPPING[model_name]
@@ -35,10 +36,34 @@ def load_config(config_path: str = "config.yaml") -> dict:
     return config
 
 
+def requires_llm(config: dict) -> bool:
+    """Check if any operation in the config requires an LLM backend."""
+    rounds = config.get("rounds", [])
+
+    for round_config in rounds:
+        operations = round_config.get("operations", [])
+        for op in operations:
+            op_type = op["type"]
+            backend = op.get("backend", get_default_backend(op_type))
+            if backend == "llm":
+                return True
+
+    return False
+
+
 def main(config_path: str = "config.yaml", resume: bool = True, clear_checkpoint: bool = False):
-    # Load config
+    # Load config (without LLM mapping first to check requirements)
     print(f"📋 Loading config from: {config_path}")
-    config = load_config(config_path)
+    config = load_config(config_path, skip_llm_mapping=True)
+
+    # Check if LLM is needed
+    needs_llm = requires_llm(config)
+
+    if needs_llm:
+        print("🤖 LLM operations detected - loading models...")
+        config = load_config(config_path, skip_llm_mapping=False)
+    else:
+        print("⚡ No LLM operations detected - skipping model loading")
 
     # Setup checkpoint directory
     output_folder = config.get("output", {}).get("output_folder", "./output")
@@ -78,8 +103,10 @@ def main(config_path: str = "config.yaml", resume: bool = True, clear_checkpoint
     save_frequency = checkpoint_config.get("save_frequency", 1)
     print(f"💾 Checkpoint save frequency: every {save_frequency} batch(es)")
 
-    # Initialize processor
-    processor = NewProcessor(**config["processor"])
+    # Initialize processor only if needed
+    processor = None
+    if needs_llm:
+        processor = NewProcessor(**config["processor"])
 
     try:
         # Initialize optimized pipeline with checkpointing
@@ -113,7 +140,8 @@ def main(config_path: str = "config.yaml", resume: bool = True, clear_checkpoint
         print(f"📋 Output columns: {list(output_df.columns)}")
 
     finally:
-        processor.terminate()
+        if processor is not None:
+            processor.terminate()
 
 
 def inspect(config_path: str = "config.yaml"):

@@ -4,7 +4,7 @@ from .base import SimpleAugmentation
 class SynonymReplace(SimpleAugmentation):
     @property
     def name(self) -> str:
-        return "synonym_replace"
+        return "synonym_replace_llm"
 
     @property
     def prompt_template(self) -> str:

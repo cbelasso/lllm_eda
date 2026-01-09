@@ -1,0 +1,131 @@
+# Test configuration for punctuation robustness
+input:
+  # dataframe_path: "/data-fast/data3/clyde/projects/eda/datasets/baseline_extracted_dataset_splits/sampled_balanced_updated_dataset_multiclass_5000_split_info.csv"
+  dataframe_path: "/data-fast/data3/clyde/projects/eda/datasets/alerts/baseline_extracted_dataset_splits_with_70_percent_negatives/sampled_balanced_updated_dataset_multiclass_5000_and_70_percent_split_info.csv"
+  text_column: "comment"
+
+# Reference corpus configuration
+reference:
+  dataframe_path: "/data-fast/data3/common/halo/applications/data_from_data_gov/extraction_dg/all_data_gov_wo_qa.csv"
+  text_column: "text"
+  min_length: 50
+  max_length: 1000
+
+# LLM processor configuration
+processor:
+  gpu_list: [1,2,3,4,5,6,7]
+  llm: "NEMO"
+  gpu_memory_utilization: 0.9
+  max_model_len: 8192
+  multiplicity: 1
+
+# Pipeline configuration
+pipeline:
+  batch_size: 25
+  chunk_size: 10000
+  prompt_batch_size: 2000
+  textattack_workers: 1 # Number of parallel workers for TextAttack operations
+
+# Checkpointing configuration
+checkpointing:
+  save_frequency: 1
+
+# Quality control
+quality:
+  min_semantic_similarity: 0.70
+  enable_validation: false
+  similarity_model: "sentence-transformers/all-mpnet-base-v2"
+
+# Output configuration
+output:
+  output_folder: "/data-fast/data3/clyde/projects/eda/datasets/alerts/augmented_datasets/alpha_70_percent"
+  save_intermediate: true
+
+rounds:
+  # Round 1: Deterministic noise + punctuation
+  - name: "round_1_noise"
+    apply_to: ["original"]
+    operations:
+      # Use fast backend (default for these types) - blazing fast
+      - type: "noise_injection_llm"
+        backend: "llm"
+        count: 1
+
+      - type: "synonym_replace_llm"
+        backend: "llm"
+        count: 1
+
+      - type: "typo_llm"
+        backend: "llm"
+        count: 1
+
+      - type: "punctuation_llm"
+        backend: "llm"
+        count: 1
+
+      - type: "noise_injection_llm"
+        backend: "llm"
+        count: 1
+
+
+      # - type: "noise_injection"
+      #   backend: "textattack"  # explicit: "fast", "textattack", or "auto" (default)
+      #   count: 1
+      #   params:
+      #     pct_words_to_swap: 0.15
+
+      # - type: "typo"
+      #   backend: "fast"
+      #   count: 2
+      #   params:
+      #     pct_words_to_swap: 0.25
+
+      # # Punctuation operations - fast
+      # - type: "punctuation"
+      #   backend: "fast"
+      #   count: 2
+
+      # - type: "terminal_punct"
+      #   backend: "fast"
+      #   count: 2
+
+      # - type: "comma"
+      #   backend: "fast"
+      #   count: 2
+
+
+# =============================================================================
+# BACKEND OPTIONS
+# =============================================================================
+# Each operation can specify backend: "fast", "textattack", or "auto" (default)
+#
+# "fast" - Native Python, 100-500x faster, good for simple transformations
+#   Available: noise_injection, typo, punctuation, terminal_punct, comma
+#
+# "textattack" - Full TextAttack framework, more variety, slower
+#   Available: noise_injection, typo, synonym_replace, homoglyph, 
+#              morphological, entity_swap, composite
+#
+# "auto" (default) - Uses fast if available, else textattack
+#
+# =============================================================================
+# PUNCTUATION TRANSFORMATIONS REFERENCE
+# =============================================================================
+#
+# punctuation:
+#   Full punctuation manipulation including:
+#   - Terminal punctuation add/remove/swap (. ! ? ...)
+#   - Internal punctuation (commas, semicolons, colons)
+#   - Ellipsis variations (. -> ... -> ..)
+#   - Spacing around punctuation
+#
+# terminal_punct:
+#   Focused on sentence-ending variations:
+#   - "Hello" <-> "Hello." <-> "Hello!" <-> "Hello?" <-> "Hello..."
+#
+# comma:
+#   Comma insertion/removal focusing on:
+#   - Transitional words (however, therefore, etc.)
+#   - Oxford comma (x, y, and z <-> x, y and z)
+#   - Compound sentences (before "and", "but", "or")
+# =============================================================================

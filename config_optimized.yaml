@@ -2,7 +2,6 @@
 input:
   dataframe_path: "/data-fast/data3/common/halo/original_models_data_gov/eec/eda_augmented_dataset/sample_5000_train_valid_test_from_combined.csv"
   text_column: "comment"
-  # All other columns (datum_id, question, annotations, type_data) are automatically preserved
 
 # Reference corpus configuration
 reference:
@@ -22,14 +21,12 @@ processor:
 # Pipeline configuration
 pipeline:
   batch_size: 25
-  chunk_size: 10000        # Process input dataframe in chunks of this size
-  prompt_batch_size: 2000  # Process prompts in batches of this size before LLM call
+  chunk_size: 10000
+  prompt_batch_size: 2000
 
 # Checkpointing configuration
 checkpointing:
-  save_frequency: 1        # Save to live file every N batches (1 = every batch, higher = less I/O)
-  # Live results are always saved to: {output_folder}/checkpoints/live_results.csv
-  # You can inspect this file while the pipeline is running
+  save_frequency: 1
 
 # Quality control
 quality:
@@ -41,63 +38,139 @@ quality:
 output:
   output_folder: "/data-fast/data3/common/halo/original_models_data_gov/eec/eda_augmented_dataset/"
   save_intermediate: true
-  # Checkpoints are saved automatically to: {output_folder}/checkpoints/
 
-# Augmentation rounds
+# =============================================================================
+# AUGMENTATION ROUNDS
+# =============================================================================
+# Each operation can specify:
+#   - type: augmentation type name
+#   - backend: "llm" or "textattack" (optional - uses smart defaults)
+#   - count: number of augmented versions per input
+#   - params: backend-specific parameters
+#
+# DEFAULT BACKENDS (when not specified):
+#   LLM: style_rewrite, paraphrase, sentence_restructure, formality_shift,
+#        elaboration, compression
+#   TextAttack: noise_injection, synonym_replace, homoglyph, typo,
+#               morphological, entity_swap, composite
+# =============================================================================
+
 rounds:
 
-  - name: "round_1_base"
+  # Round 1: Deterministic noise (TextAttack - fast, no GPU needed for this)
+  - name: "round_1_noise"
     apply_to: ["original"]
     operations:
       - type: "noise_injection"
-        count: 2
+        # backend: "textattack"  # This is the default, so optional
+        count: 1
+        params:
+          transformations: ["qwerty", "char_delete", "char_swap"]
+          pct_words_to_swap: 0.15
+          transformations_per_example: 3
+          constraints: "minimal"
+
+      - type: "typo"
+        count: 1
+        params:
+          pct_words_to_swap: 0.10
+          transformations_per_example: 2
+
+  # Round 2: Deterministic lexical variations (TextAttack)
+  - name: "round_2_lexical"
+    apply_to: ["original"]
+    operations:
       - type: "synonym_replace"
+        # backend: "textattack"  # Default
         count: 2
-  
-  # # Round 1: Base transformations
-  # - name: "round_1_base"
-  #   apply_to: ["original"]
-  #   operations:
-  #     - type: "style_rewrite"
-  #       count: 1
-  #     - type: "paraphrase"
-  #       count: 1
-  #     - type: "formality_shift"
-  #       count: 1
-  #       params:
-  #         direction: "more casual"
+        params:
+          pct_words_to_swap: 0.20
+          transformations_per_example: 3
+          constraints: "default"
 
-  # # Round 2: Lexical variations
-  # - name: "round_2_lexical"
-  #   apply_to: ["original", "round_1_base"]
-  #   operations:
-  #     - type: "synonym_replace"
-  #       count: 1
-  #     - type: "sentence_restructure"
-  #       count: 1
+      - type: "morphological"
+        count: 1
+        params:
+          pct_words_to_swap: 0.15
+          constraints: "default"
 
-  # # Round 3: Noise injection
-  # - name: "round_3_noise"
-  #   apply_to: ["round_1_base", "round_2_lexical"]
-  #   operations:
-  #     - type: "noise_injection"
-  #       count: 2
+  # Round 3: Semantic transformations (LLM - requires understanding)
+  - name: "round_3_semantic"
+    apply_to: ["original"]
+    operations:
+      - type: "paraphrase"
+        backend: "llm"  # Explicit, though it's the default
+        count: 1
 
-  # # Round 4: Cross-pollination (using round 2 as style references)
-  # - name: "round_4_cross"
-  #   apply_to: ["original"]
-  #   operations:
-  #     - type: "style_rewrite"
-  #       count: 2
-  #       params:
-  #         reference_pool: "round_2_lexical"
+      - type: "sentence_restructure"
+        backend: "llm"
+        count: 1
 
-  # # Round 5: Compound operations
-  # - name: "round_5_compound"
-  #   apply_to: ["original", "round_4_cross"]
-  #   operations:
-  #     - type: "compound"
-  #       count: 1
-  #       sequences:
-  #         - ["paraphrase", "noise_injection"]
-  #         - ["synonym_replace", "sentence_restructure"]
+  # Round 4: Style transfer (LLM only - no TextAttack equivalent)
+  - name: "round_4_style"
+    apply_to: ["original"]
+    operations:
+      - type: "style_rewrite"
+        count: 1
+
+      - type: "formality_shift"
+        count: 1
+        params:
+          direction: "more casual"
+
+  # Round 5: Adversarial robustness (TextAttack)
+  - name: "round_5_adversarial"
+    apply_to: ["round_3_semantic"]
+    operations:
+      - type: "homoglyph"
+        count: 1
+        params:
+          pct_words_to_swap: 0.10
+
+      - type: "entity_swap"
+        count: 1
+        params:
+          entity_types: ["name", "number"]
+          pct_words_to_swap: 0.30
+
+  # Round 6: Compound (chain TextAttack on LLM outputs)
+  - name: "round_6_compound"
+    apply_to: ["round_4_style"]
+    operations:
+      - type: "noise_injection"
+        count: 1
+        params:
+          transformations: ["qwerty", "char_swap"]
+          pct_words_to_swap: 0.10
+
+# =============================================================================
+# TEXTATTACK PARAMETER REFERENCE
+# =============================================================================
+#
+# TRANSFORMATIONS (for composite/noise_injection):
+#   Character-level:
+#     - qwerty: keyboard proximity typos
+#     - char_delete: random character deletion
+#     - char_insert: random character insertion
+#     - char_substitute: random character replacement
+#     - char_swap: adjacent character transposition
+#     - homoglyph: visually similar unicode substitution
+#   Word-level:
+#     - wordnet: WordNet synonym replacement
+#     - inflection: morphological variations
+#     - contract: expand contractions (don't -> do not)
+#     - extend: contract expansions (do not -> don't)
+#     - change_name: swap named entities
+#     - change_number: perturb numbers
+#     - change_location: swap locations
+#
+# CONSTRAINTS:
+#   - "default": RepeatModification + StopwordModification
+#   - "strict": default + MinWordLength(4)
+#   - "minimal": RepeatModification only
+#   - "none": no constraints
+#
+# COMMON PARAMS:
+#   - pct_words_to_swap: fraction of words to modify (0.0-1.0)
+#   - transformations_per_example: number of transformation attempts
+# =============================================================================

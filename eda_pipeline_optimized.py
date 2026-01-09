@@ -4,16 +4,65 @@ import gc
 import json
 from pathlib import Path
 import random
-from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
-from llm_parallelization.new_processor import NewProcessor
+if TYPE_CHECKING:
+    from llm_parallelization.new_processor import NewProcessor
+
+from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from prompts import AUGMENTATION_REGISTRY, get_augmentation
+from prompts import (
+    AUGMENTATION_REGISTRY,
+    TextAttackAugmentation,
+    get_augmentation,
+    get_default_backend,
+    is_llm_augmentation,
+    is_textattack_augmentation,
+)
+from prompts.fast_augmentations import get_fast_augmentation, is_fast_augmentation_available
+
+
+def _process_single_textattack_task(
+    task: Dict[str, Any], op_type: str, params: Dict[str, Any], use_fast: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Process a single TextAttack task.
+    Module-level function for joblib pickling compatibility.
+    """
+    from prompts import get_augmentation
+    from prompts.fast_augmentations import get_fast_augmentation, is_fast_augmentation_available
+
+    text = task["text"]
+    count = task["_count"]
+
+    # Use fast augmentation if requested and available
+    if use_fast and is_fast_augmentation_available(op_type):
+        augmenter = get_fast_augmentation(op_type, params)
+        augmented_texts = augmenter.augment(text, n=count)
+    else:
+        # Fall back to TextAttack
+        augmentation = get_augmentation(op_type, backend="textattack")
+        augmenter = augmentation.get_augmenter(params)
+        augmented_texts = []
+        for _ in range(count):
+            try:
+                result = augmenter.augment(text)
+                augmented_texts.append(result[0] if result else text)
+            except Exception:
+                augmented_texts.append(text)
+
+    task_results = []
+    for aug_text in augmented_texts:
+        result = {k: v for k, v in task.items() if not k.startswith("_") and k != "text"}
+        result["text"] = aug_text
+        task_results.append(result)
+
+    return task_results
 
 
 class AugmentedText(BaseModel):
@@ -24,13 +73,6 @@ class CheckpointManager:
     """Manages checkpointing for pipeline resumption with granular batch-level saves."""
 
     def __init__(self, checkpoint_dir: Path, save_frequency: int = 1):
-        """
-        Initialize checkpoint manager.
-
-        Args:
-            checkpoint_dir: Directory for checkpoint files
-            save_frequency: Save to live file every N batches (1 = every batch)
-        """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.checkpoint_dir / "pipeline_state.json"
@@ -53,7 +95,6 @@ class CheckpointManager:
         batch_in_round: int = 0,
         completed_rounds_in_chunk: List[str] = None,
     ):
-        """Save pipeline state for resumption with batch-level granularity."""
         state = {
             "completed_chunks": completed_chunks,
             "current_chunk": current_chunk,
@@ -69,14 +110,12 @@ class CheckpointManager:
             json.dump(state, f, indent=2)
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        """Load previous pipeline state if exists."""
         if not self.state_file.exists():
             return None
         with open(self.state_file, "r") as f:
             return json.load(f)
 
     def append_output(self, df: pd.DataFrame, first_write: bool = False):
-        """Append results to checkpoint output file."""
         df.to_csv(
             self.output_file,
             mode="w" if first_write else "a",
@@ -90,27 +129,14 @@ class CheckpointManager:
         force_flush: bool = False,
         column_order: Optional[List[str]] = None,
     ) -> int:
-        """
-        Append batch results to live file for real-time inspection.
-
-        Args:
-            results: List of result dictionaries to append
-            force_flush: Force write even if batch threshold not met
-            column_order: Column ordering for consistent output
-
-        Returns:
-            Number of rows written (0 if buffered, >0 if flushed)
-        """
         if not results:
             return 0
 
-        # Store column order for consistent output
         if column_order and not self._column_order:
             self._column_order = column_order
 
         batch_df = pd.DataFrame(results)
 
-        # Ensure all expected columns exist (fill missing with None)
         if self._column_order:
             for col in self._column_order:
                 if col not in batch_df.columns:
@@ -121,26 +147,21 @@ class CheckpointManager:
 
         rows_written = 0
 
-        # Flush if threshold met or forced
         if force_flush or self._batch_counter >= self.save_frequency:
             rows_written = self._flush_to_live()
 
         return rows_written
 
     def _flush_to_live(self) -> int:
-        """Flush pending rows to live file."""
         if not self._pending_rows:
             return 0
 
-        # Ensure all dataframes have the same columns before concatenation
         if self._column_order:
             normalized_dfs = []
             for df in self._pending_rows:
-                # Add missing columns
                 for col in self._column_order:
                     if col not in df.columns:
                         df[col] = None
-                # Reorder columns (keep only expected + any extra)
                 available_cols = [c for c in self._column_order if c in df.columns]
                 extra_cols = sorted([c for c in df.columns if c not in self._column_order])
                 df = df[available_cols + extra_cols]
@@ -149,13 +170,11 @@ class CheckpointManager:
         else:
             combined_df = pd.concat(self._pending_rows, ignore_index=True)
 
-        # Apply final column ordering
         if self._column_order:
             available_cols = [c for c in self._column_order if c in combined_df.columns]
             extra_cols = sorted([c for c in combined_df.columns if c not in self._column_order])
             combined_df = combined_df[available_cols + extra_cols]
 
-        # Write to live file
         is_first_write = not self._live_file_initialized
         combined_df.to_csv(
             self.live_file,
@@ -167,36 +186,30 @@ class CheckpointManager:
         self._live_file_initialized = True
         rows_written = len(combined_df)
 
-        # Clear buffer
         self._pending_rows = []
         self._batch_counter = 0
 
         return rows_written
 
     def flush_pending(self) -> int:
-        """Force flush any pending rows to live file."""
         return self._flush_to_live()
 
     def load_output(self) -> Optional[pd.DataFrame]:
-        """Load checkpoint output if exists."""
         if not self.output_file.exists():
             return None
         return pd.read_csv(self.output_file)
 
     def load_live_results(self) -> Optional[pd.DataFrame]:
-        """Load current live results for inspection."""
         if not self.live_file.exists():
             return None
         return pd.read_csv(self.live_file)
 
     def get_live_stats(self) -> Dict[str, Any]:
-        """Get statistics about live results without loading full dataframe."""
         if not self.live_file.exists():
             return {"exists": False, "rows": 0}
 
-        # Count rows efficiently
         with open(self.live_file, "r") as f:
-            row_count = sum(1 for _ in f) - 1  # Subtract header
+            row_count = sum(1 for _ in f) - 1
 
         return {
             "exists": True,
@@ -206,7 +219,6 @@ class CheckpointManager:
         }
 
     def clear(self):
-        """Clear checkpoint files."""
         if self.state_file.exists():
             self.state_file.unlink()
         if self.output_file.exists():
@@ -216,21 +228,18 @@ class CheckpointManager:
         self._reset_live_state()
 
     def _reset_live_state(self):
-        """Reset live file tracking state."""
         self._batch_counter = 0
         self._pending_rows = []
         self._live_file_initialized = False
         self._column_order = None
 
     def exists(self) -> bool:
-        """Check if a checkpoint exists."""
         return self.state_file.exists() and self.output_file.exists()
 
 
 class EDAPipelineOptimized:
-    """Optimized EDA Pipeline with metadata preservation and granular checkpointing."""
+    """Optimized EDA Pipeline with hybrid LLM/TextAttack support."""
 
-    # Columns added by the pipeline (not from original data)
     PIPELINE_COLUMNS = {
         "text_id",
         "source_id",
@@ -240,11 +249,12 @@ class EDAPipelineOptimized:
         "augmentation_chain",
         "depth",
         "parent_text_id",
+        "backend",
     }
 
     def __init__(
         self,
-        processor: NewProcessor,
+        processor: Optional["NewProcessor"] = None,
         reference_df: Optional[pd.DataFrame] = None,
         reference_text_col: str = "text",
         min_semantic_similarity: float = 0.75,
@@ -253,27 +263,13 @@ class EDAPipelineOptimized:
         checkpoint_dir: Optional[str] = None,
         checkpoint_save_frequency: int = 1,
     ):
-        """
-        Initialize the EDA Pipeline.
-
-        Args:
-            processor: LLM processor instance
-            reference_df: Reference corpus dataframe for style transfer
-            reference_text_col: Column name for reference texts
-            min_semantic_similarity: Minimum similarity threshold for validation
-            enable_validation: Enable semantic similarity validation
-            similarity_model_name: Sentence transformer model for validation
-            checkpoint_dir: Directory for checkpoints
-            checkpoint_save_frequency: Save to live file every N batches
-        """
-        self.processor = processor
+        self.processor = processor  # Can be None for TextAttack-only pipelines
         self.reference_df = reference_df
         self.reference_text_col = reference_text_col
         self.min_semantic_similarity = min_semantic_similarity
         self.enable_validation = enable_validation
         self.checkpoint_save_frequency = checkpoint_save_frequency
 
-        # Checkpoint manager
         if checkpoint_dir:
             self.checkpoint_mgr = CheckpointManager(
                 Path(checkpoint_dir), save_frequency=checkpoint_save_frequency
@@ -281,13 +277,9 @@ class EDAPipelineOptimized:
         else:
             self.checkpoint_mgr = None
 
-        # Track metadata columns from input
         self.metadata_columns: List[str] = []
-
-        # Column ordering for consistent output
         self._column_order: Optional[List[str]] = None
 
-        # Pre-sample reference texts for faster access
         if reference_df is not None and not reference_df.empty:
             self._precompute_reference_buckets()
 
@@ -299,7 +291,6 @@ class EDAPipelineOptimized:
             self.similarity_model = None
 
     def _precompute_reference_buckets(self):
-        """Pre-bucket reference texts by length for O(1) sampling."""
         self.reference_buckets = defaultdict(list)
         lengths = self.reference_df[self.reference_text_col].str.len()
 
@@ -311,7 +302,6 @@ class EDAPipelineOptimized:
         print(f"📦 Pre-computed {len(self.reference_bucket_keys)} reference buckets")
 
     def _sample_reference_fast(self, text_len: int) -> str:
-        """Fast reference sampling using pre-computed buckets."""
         target_bucket = text_len // 50 * 50
         min_bucket = max(0, target_bucket - 100)
         max_bucket = target_bucket + 100
@@ -333,7 +323,6 @@ class EDAPipelineOptimized:
         original_texts: List[str],
         augmented_texts: List[str],
     ) -> List[bool]:
-        """Batch validation for efficiency."""
         if not self.enable_validation or self.similarity_model is None:
             return [True] * len(original_texts)
 
@@ -356,12 +345,10 @@ class EDAPipelineOptimized:
         return (similarities >= self.min_semantic_similarity).tolist()
 
     def build_prompt(self, aug_type: str, text: str, params: Dict[str, Any]) -> str:
-        """Build prompt using the augmentation registry."""
-        # Defensive check for invalid text
         if pd.isna(text) or not isinstance(text, str) or not text.strip():
             raise ValueError(f"Invalid text value for augmentation: {text!r}")
 
-        augmentation = get_augmentation(aug_type)
+        augmentation = get_augmentation(aug_type, backend="llm")
 
         if augmentation.requires_reference:
             if "reference" not in params:
@@ -370,19 +357,16 @@ class EDAPipelineOptimized:
         return augmentation.build_prompt(text, params)
 
     def _extract_metadata(self, row: pd.Series, text_column: str) -> Dict[str, Any]:
-        """Extract all metadata columns from a row."""
         return {k: v for k, v in row.items() if k != text_column}
 
     def _preserve_metadata(
         self, source: Dict[str, Any], exclude_pipeline_cols: bool = True
     ) -> Dict[str, Any]:
-        """Preserve metadata from source, optionally excluding pipeline columns."""
         if exclude_pipeline_cols:
             return {k: v for k, v in source.items() if k not in self.PIPELINE_COLUMNS}
         return {k: v for k, v in source.items() if k not in {"text", "prompt"}}
 
     def _get_column_order(self) -> List[str]:
-        """Get consistent column ordering for output files."""
         if self._column_order:
             return self._column_order
 
@@ -394,6 +378,7 @@ class EDAPipelineOptimized:
             "augmentation_chain",
             "depth",
             "parent_text_id",
+            "backend",
         ]
         metadata_cols = sorted(self.metadata_columns)
         self._column_order = pipeline_cols + metadata_cols
@@ -402,9 +387,30 @@ class EDAPipelineOptimized:
     def _dataframe_chunks(
         self, df: pd.DataFrame, chunk_size: int
     ) -> Generator[Tuple[int, pd.DataFrame], None, None]:
-        """Yield dataframe chunks with their starting index."""
         for start_idx in range(0, len(df), chunk_size):
             yield start_idx, df.iloc[start_idx : start_idx + chunk_size]
+
+    def _get_operation_backend(self, operation: Dict[str, Any]) -> str:
+        """Determine which backend to use for an operation."""
+        if "backend" in operation:
+            return operation["backend"]
+        return get_default_backend(operation["type"])
+
+    def _partition_operations_by_backend(
+        self, operations: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Partition operations into LLM and TextAttack groups."""
+        llm_ops = []
+        textattack_ops = []
+
+        for op in operations:
+            backend = self._get_operation_backend(op)
+            if backend == "llm":
+                llm_ops.append(op)
+            else:
+                textattack_ops.append(op)
+
+        return llm_ops, textattack_ops
 
     def _build_prompts_vectorized(
         self,
@@ -412,7 +418,6 @@ class EDAPipelineOptimized:
         operation: Dict[str, Any],
         round_name: str,
     ) -> List[Dict[str, Any]]:
-        """Build prompts with metadata preservation."""
         op_type = operation["type"]
         count = operation.get("count", 1)
         params = operation.get("params", {})
@@ -420,12 +425,10 @@ class EDAPipelineOptimized:
         prompts = []
 
         for source in source_texts:
-            # Skip sources with invalid text
             text = source.get("text")
             if pd.isna(text) or not isinstance(text, str) or not text.strip():
                 continue
 
-            # Preserve all metadata from source
             metadata = self._preserve_metadata(source)
             base_chain = source.get("augmentation_chain", [])
             base_depth = source.get("depth", 0)
@@ -442,17 +445,219 @@ class EDAPipelineOptimized:
 
                 prompts.append(
                     {
-                        **metadata,  # All original metadata columns
+                        **metadata,
                         "prompt": prompt_text,
                         "source_id": source["source_id"],
                         "parent_text_id": source.get("text_id"),
                         "round": round_name,
                         "augmentation_chain": base_chain + [op_type],
                         "depth": base_depth + 1,
+                        "backend": "llm",
                     }
                 )
 
         return prompts
+
+    def _build_textattack_tasks(
+        self,
+        source_texts: List[Dict[str, Any]],
+        operation: Dict[str, Any],
+        round_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Build tasks for TextAttack processing."""
+        op_type = operation["type"]
+        count = operation.get("count", 1)
+        params = operation.get("params", {})
+        # Allow explicit backend override: "fast" or "textattack"
+        preferred_backend = operation.get("backend", "auto")
+
+        tasks = []
+
+        for source in source_texts:
+            text = source.get("text")
+            if pd.isna(text) or not isinstance(text, str) or not text.strip():
+                continue
+
+            metadata = self._preserve_metadata(source)
+            base_chain = source.get("augmentation_chain", [])
+            base_depth = source.get("depth", 0)
+
+            tasks.append(
+                {
+                    **metadata,
+                    "text": source["text"],
+                    "source_id": source["source_id"],
+                    "parent_text_id": source.get("text_id"),
+                    "round": round_name,
+                    "augmentation_chain": base_chain + [op_type],
+                    "depth": base_depth + 1,
+                    "backend": "textattack",
+                    "_op_type": op_type,
+                    "_count": count,
+                    "_params": params,
+                    "_preferred_backend": preferred_backend,
+                }
+            )
+
+        return tasks
+
+    def _process_textattack_batch(
+        self,
+        tasks: List[Dict[str, Any]],
+        all_texts_lookup: Dict[str, List[Dict[str, Any]]],
+        show_progress: bool = True,
+        workers: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Process a batch of TextAttack tasks with optional parallelization."""
+        if not tasks:
+            return []
+
+        results = []
+
+        # Group tasks by operation type for efficiency
+        tasks_by_op: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for task in tasks:
+            tasks_by_op[task["_op_type"]].append(task)
+
+        for op_type, op_tasks in tasks_by_op.items():
+            # Get params and backend preference from first task
+            params = op_tasks[0]["_params"] if op_tasks else {}
+            preferred_backend = (
+                op_tasks[0].get("_preferred_backend", "auto") if op_tasks else "auto"
+            )
+
+            # Determine whether to use fast augmentation
+            use_fast = False
+            if preferred_backend == "fast":
+                use_fast = is_fast_augmentation_available(op_type)
+                if not use_fast:
+                    print(
+                        f"      ⚠️ Fast backend requested but not available for {op_type}, using TextAttack"
+                    )
+            elif preferred_backend == "auto":
+                use_fast = is_fast_augmentation_available(op_type)
+            # If preferred_backend == "textattack", use_fast stays False
+
+            if workers > 1:
+                # Parallel processing with joblib
+                mode = "[FAST]" if use_fast else "[TextAttack]"
+                if show_progress:
+                    print(
+                        f"      {mode} {op_type}: {len(op_tasks)} tasks with {workers} workers..."
+                    )
+
+                # Use joblib - each worker will check fast availability
+                parallel_results = Parallel(n_jobs=workers, backend="loky", verbose=0)(
+                    delayed(_process_single_textattack_task)(task, op_type, params, use_fast)
+                    for task in op_tasks
+                )
+
+                for task_results in parallel_results:
+                    results.extend(task_results)
+
+                if show_progress:
+                    total_augmented = sum(len(r) for r in parallel_results)
+                    print(f"      ✓ {op_type}: generated {total_augmented} texts")
+            else:
+                # Sequential processing
+                fast_aug = None
+                textattack_augmenter = None
+
+                if use_fast:
+                    fast_aug = get_fast_augmentation(op_type, params)
+                    print(f"      [FAST] Processing {len(op_tasks)} tasks for {op_type}")
+                else:
+                    augmentation = get_augmentation(op_type, backend="textattack")
+                    textattack_augmenter = augmentation.get_augmenter(params)
+                    print(
+                        f"      [TextAttack BATCH] Processing {len(op_tasks)} tasks for {op_type}"
+                    )
+
+                if fast_aug:
+                    # Fast augmentation - process one by one (already fast)
+                    task_iter = op_tasks
+                    if show_progress:
+                        task_iter = tqdm(
+                            op_tasks,
+                            desc=f"      ⚡ {op_type}",
+                            leave=False,
+                            colour="#FFA500",
+                        )
+
+                    for task in task_iter:
+                        text = task["text"]
+                        count = task["_count"]
+                        augmented_texts = fast_aug.augment(text, n=count)
+                        for aug_text in augmented_texts:
+                            result = {
+                                k: v
+                                for k, v in task.items()
+                                if not k.startswith("_") and k != "text"
+                            }
+                            result["text"] = aug_text
+                            results.append(result)
+                else:
+                    # TextAttack - use batch processing with augment_many
+                    # Group by count to batch efficiently
+                    tasks_by_count: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+                    for task in op_tasks:
+                        tasks_by_count[task["_count"]].append(task)
+
+                    for count, count_tasks in tasks_by_count.items():
+                        texts = [t["text"] for t in count_tasks]
+
+                        # Process each count iteration
+                        for _ in range(count):
+                            if show_progress:
+                                print(f"      ⚡ {op_type}: batch of {len(texts)} texts...")
+
+                            try:
+                                # Use augment_many for batch processing
+                                augmented_batch = textattack_augmenter.augment_many(text)
+                            except Exception as e:
+                                print(
+                                    f"      ⚠️ TextAttack batch error: {e}, falling back to sequential"
+                                )
+                                augmented_batch = [[t] for t in texts]
+
+                            # augment_many returns list of lists
+                            for task, aug_results in zip(count_tasks, augmented_batch):
+                                aug_text = aug_results[0] if aug_results else task["text"]
+                                result = {
+                                    k: v
+                                    for k, v in task.items()
+                                    if not k.startswith("_") and k != "text"
+                                }
+                                result["text"] = aug_text
+                                results.append(result)
+
+        # Validate if enabled
+        if self.enable_validation and results:
+            original_texts = []
+            augmented_texts = []
+
+            for result in results:
+                source_id = result["source_id"]
+                original_text = None
+                if "original" in all_texts_lookup:
+                    for t in all_texts_lookup["original"]:
+                        if t["source_id"] == source_id:
+                            original_text = t["text"]
+                            break
+
+                if original_text:
+                    original_texts.append(original_text)
+                    augmented_texts.append(result["text"])
+                else:
+                    original_texts.append(result["text"])
+                    augmented_texts.append(result["text"])
+
+            validity_flags = self._validate_semantic_similarity_batch(
+                original_texts, augmented_texts
+            )
+            results = [r for r, v in zip(results, validity_flags) if v]
+
+        return results
 
     def _build_compound_prompts_vectorized(
         self,
@@ -460,14 +665,12 @@ class EDAPipelineOptimized:
         operation: Dict[str, Any],
         round_name: str,
     ) -> List[Dict[str, Any]]:
-        """Build compound prompts with metadata preservation."""
         sequences = operation.get("sequences", [])
         count = operation.get("count", 1)
 
         prompts = []
 
         for source in source_texts:
-            # Skip sources with invalid text
             text = source.get("text")
             if pd.isna(text) or not isinstance(text, str) or not text.strip():
                 continue
@@ -489,13 +692,13 @@ class EDAPipelineOptimized:
                             "round": round_name,
                             "augmentation_chain": base_chain + sequence,
                             "depth": base_depth + len(sequence),
+                            "backend": "llm",
                         }
                     )
 
         return prompts
 
     def _build_compound_prompt_text(self, text: str, sequence: List[str]) -> str:
-        """Build a compound prompt that chains multiple operations."""
         operations_desc = ", then ".join(sequence)
 
         return f"""Apply the following transformations in sequence to the text:
@@ -516,26 +719,28 @@ Respond in JSON: {{"rewritten": "..."}}"""
         batch_size: int = 25,
         prompt_batch_size: int = 1000,
         on_batch_complete: Optional[callable] = None,
+        show_progress: bool = True,
+        textattack_workers: int = 1,
     ) -> Generator[List[Dict[str, Any]], None, None]:
-        """
-        Apply a round with streaming to reduce memory footprint.
-
-        Args:
-            round_config: Configuration for this round
-            round_name: Name of the round
-            source_texts_iter: Iterator of source text batches
-            all_texts_lookup: Lookup dict for all texts by round
-            batch_size: LLM batch size
-            prompt_batch_size: Number of prompts to accumulate before processing
-            on_batch_complete: Optional callback after each batch is processed
-        """
+        """Apply a round with streaming, routing to appropriate backend."""
 
         print(f"\n🔄 Starting {round_name} (streaming mode)...")
 
         operations = round_config.get("operations", [])
 
+        # Partition operations by backend
+        llm_ops, textattack_ops = self._partition_operations_by_backend(operations)
+
+        if llm_ops:
+            print(f"   📝 LLM operations: {[op['type'] for op in llm_ops]}")
+        if textattack_ops:
+            worker_info = f", {textattack_workers} workers" if textattack_workers > 1 else ""
+            print(
+                f"   ⚡ TextAttack operations: {[op['type'] for op in textattack_ops]}{worker_info}"
+            )
+
         # Pre-fetch reference pools if needed
-        for op in operations:
+        for op in llm_ops:
             if op["type"] == "style_rewrite" and "reference_pool" in op.get("params", {}):
                 pool_name = op["params"]["reference_pool"]
                 if pool_name in all_texts_lookup:
@@ -543,12 +748,18 @@ Respond in JSON: {{"rewritten": "..."}}"""
                         t["text"] for t in all_texts_lookup[pool_name]
                     ]
 
-        prompt_buffer = []
+        llm_prompt_buffer = []
+        textattack_task_buffer = []
         total_generated = 0
         batch_idx = 0
+        source_count = 0
 
+        # Wrap source iterator with progress
         for source_batch in source_texts_iter:
-            for op in operations:
+            source_count += len(source_batch)
+
+            # Build LLM prompts
+            for op in llm_ops:
                 op_type = op["type"]
 
                 if op_type == "compound":
@@ -558,13 +769,19 @@ Respond in JSON: {{"rewritten": "..."}}"""
                 else:
                     prompts = self._build_prompts_vectorized(source_batch, op, round_name)
 
-                prompt_buffer.extend(prompts)
+                llm_prompt_buffer.extend(prompts)
 
-            while len(prompt_buffer) >= prompt_batch_size:
-                batch_to_process = prompt_buffer[:prompt_batch_size]
-                prompt_buffer = prompt_buffer[prompt_batch_size:]
+            # Build TextAttack tasks
+            for op in textattack_ops:
+                tasks = self._build_textattack_tasks(source_batch, op, round_name)
+                textattack_task_buffer.extend(tasks)
 
-                results = self._process_prompt_batch(
+            # Process LLM prompts when buffer is full
+            while len(llm_prompt_buffer) >= prompt_batch_size:
+                batch_to_process = llm_prompt_buffer[:prompt_batch_size]
+                llm_prompt_buffer = llm_prompt_buffer[prompt_batch_size:]
+
+                results = self._process_llm_prompt_batch(
                     batch_to_process, all_texts_lookup, batch_size
                 )
                 total_generated += len(results)
@@ -575,8 +792,31 @@ Respond in JSON: {{"rewritten": "..."}}"""
                         on_batch_complete(results, batch_idx, round_name)
                     yield results
 
-        if prompt_buffer:
-            results = self._process_prompt_batch(prompt_buffer, all_texts_lookup, batch_size)
+            # Process TextAttack tasks when buffer is full
+            while len(textattack_task_buffer) >= prompt_batch_size:
+                batch_to_process = textattack_task_buffer[:prompt_batch_size]
+                textattack_task_buffer = textattack_task_buffer[prompt_batch_size:]
+
+                print(f"   📦 Processing TextAttack batch ({len(batch_to_process)} tasks)...")
+                results = self._process_textattack_batch(
+                    batch_to_process,
+                    all_texts_lookup,
+                    show_progress=show_progress,
+                    workers=textattack_workers,
+                )
+                total_generated += len(results)
+                batch_idx += 1
+
+                if results:
+                    if on_batch_complete:
+                        on_batch_complete(results, batch_idx, round_name)
+                    yield results
+
+        # Process remaining LLM prompts
+        if llm_prompt_buffer:
+            results = self._process_llm_prompt_batch(
+                llm_prompt_buffer, all_texts_lookup, batch_size
+            )
             total_generated += len(results)
             batch_idx += 1
 
@@ -585,17 +825,42 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     on_batch_complete(results, batch_idx, round_name)
                 yield results
 
-        print(f"✅ Generated {total_generated} texts in {round_name}")
+        # Process remaining TextAttack tasks
+        if textattack_task_buffer:
+            print(
+                f"   📦 Processing final TextAttack batch ({len(textattack_task_buffer)} tasks)..."
+            )
+            results = self._process_textattack_batch(
+                textattack_task_buffer,
+                all_texts_lookup,
+                show_progress=show_progress,
+                workers=textattack_workers,
+            )
+            total_generated += len(results)
+            batch_idx += 1
 
-    def _process_prompt_batch(
+            if results:
+                if on_batch_complete:
+                    on_batch_complete(results, batch_idx, round_name)
+                yield results
+
+        print(f"✅ {round_name}: {source_count} sources → {total_generated} augmented texts")
+
+    def _process_llm_prompt_batch(
         self,
         prompt_batch: List[Dict[str, Any]],
         all_texts_lookup: Dict[str, List[Dict[str, Any]]],
         batch_size: int,
     ) -> List[Dict[str, Any]]:
-        """Process a batch of prompts and validate results."""
+        """Process a batch of LLM prompts."""
         if not prompt_batch:
             return []
+
+        if self.processor is None:
+            raise RuntimeError(
+                "LLM processor is not initialized but LLM operations were requested. "
+                "This should not happen - check your config for backend specifications."
+            )
 
         prompt_texts = [p["prompt"] for p in prompt_batch]
 
@@ -663,15 +928,14 @@ Respond in JSON: {{"rewritten": "..."}}"""
         print(f"🚀 Starting Optimized EDA Pipeline (chunk_size={chunk_size})...")
         print(f"📊 Total input rows: {len(input_df)}")
 
-        # Identify and store metadata columns
         self.metadata_columns = [c for c in input_df.columns if c != text_column]
         print(f"📋 Preserving metadata columns: {self.metadata_columns}")
 
         batch_size = config.get("pipeline", {}).get("batch_size", 25)
         prompt_batch_size = config.get("pipeline", {}).get("prompt_batch_size", 2000)
+        textattack_workers = config.get("pipeline", {}).get("textattack_workers", 1)
         rounds = config.get("rounds", [])
 
-        # Check for existing checkpoint
         start_chunk_idx = 0
         global_text_id = 0
         total_output_count = 0
@@ -692,7 +956,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                 print(f"   - Global text ID: {global_text_id}")
                 print(f"   - Total output so far: {total_output_count}")
 
-                # Show live file stats
                 live_stats = self.checkpoint_mgr.get_live_stats()
                 if live_stats["exists"]:
                     print(f"   - Live results file: {live_stats['rows']} rows")
@@ -704,10 +967,8 @@ Respond in JSON: {{"rewritten": "..."}}"""
 
         all_texts_lookup: Dict[str, List[Dict[str, Any]]] = {}
 
-        # Initialize column order
         column_order = self._get_column_order()
 
-        # Define batch completion callback for live saving
         def on_batch_complete(results: List[Dict[str, Any]], batch_idx: int, round_name: str):
             nonlocal total_output_count
             if self.checkpoint_mgr and results:
@@ -717,25 +978,21 @@ Respond in JSON: {{"rewritten": "..."}}"""
                 if rows_written > 0:
                     print(f"   💾 Saved {rows_written} rows to live file (batch {batch_idx})")
 
-        # Process input in chunks
         chunk_list = list(self._dataframe_chunks(input_df, chunk_size))
 
         for chunk_idx, (chunk_start, chunk_df) in enumerate(
             tqdm(chunk_list, desc="Processing chunks", colour="#4CAF50")
         ):
-            # Skip already completed chunks
             if chunk_idx in completed_chunks:
                 print(f"⏭️  Skipping completed chunk {chunk_idx}")
                 continue
 
             chunk_texts_lookup: Dict[str, List[Dict[str, Any]]] = {}
 
-            # Initialize original texts with ALL metadata (filter out NaN texts)
             original_texts = []
             nan_count = 0
             for idx, row in chunk_df.iterrows():
                 text_value = row[text_column]
-                # Skip rows with NaN or empty text
                 if pd.isna(text_value) or (
                     isinstance(text_value, str) and not text_value.strip()
                 ):
@@ -746,12 +1003,13 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     {
                         "text_id": global_text_id,
                         "source_id": idx,
-                        "text": str(text_value),  # Ensure string type
+                        "text": str(text_value),
                         "round": "original",
                         "augmentation_chain": [],
                         "depth": 0,
-                        "parent_text_id": None,  # Ensure column exists for alignment
-                        **self._extract_metadata(row, text_column),  # All metadata
+                        "parent_text_id": None,
+                        "backend": "original",
+                        **self._extract_metadata(row, text_column),
                     }
                 )
                 global_text_id += 1
@@ -761,18 +1019,15 @@ Respond in JSON: {{"rewritten": "..."}}"""
 
             chunk_texts_lookup["original"] = original_texts
 
-            # Save original texts to live file
             if self.checkpoint_mgr:
                 self.checkpoint_mgr.append_batch_to_live(
                     original_texts, force_flush=True, column_order=column_order
                 )
 
-            # Process each round
             for round_config in rounds:
                 round_name = round_config["name"]
                 apply_to = round_config.get("apply_to", ["original"])
 
-                # Skip already completed rounds in current chunk
                 if round_name in completed_rounds_in_chunk:
                     print(f"⏭️  Skipping completed round {round_name}")
                     continue
@@ -808,6 +1063,7 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     batch_size=batch_size,
                     prompt_batch_size=prompt_batch_size,
                     on_batch_complete=on_batch_complete,
+                    textattack_workers=textattack_workers,
                 ):
                     for result in batch_results:
                         result["text_id"] = global_text_id
@@ -816,7 +1072,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     round_outputs.extend(batch_results)
                     batch_in_round += 1
 
-                    # Update checkpoint after each batch within a round
                     if self.checkpoint_mgr:
                         self.checkpoint_mgr.save_state(
                             completed_chunks=completed_chunks,
@@ -832,7 +1087,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                 chunk_texts_lookup[round_name] = round_outputs
                 completed_rounds_in_chunk.append(round_name)
 
-                # Flush any pending rows after each round
                 if self.checkpoint_mgr:
                     self.checkpoint_mgr.flush_pending()
                     self.checkpoint_mgr.save_state(
@@ -845,7 +1099,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                         completed_rounds_in_chunk=completed_rounds_in_chunk,
                     )
 
-            # Combine all chunk outputs and write incrementally
             chunk_output = []
             for round_name, texts in chunk_texts_lookup.items():
                 chunk_output.extend(texts)
@@ -853,7 +1106,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
             if chunk_output:
                 chunk_df_out = pd.DataFrame(chunk_output)
 
-                # Ensure consistent column ordering
                 pipeline_cols = [
                     "text_id",
                     "source_id",
@@ -862,6 +1114,7 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     "augmentation_chain",
                     "depth",
                     "parent_text_id",
+                    "backend",
                 ]
                 other_cols = [c for c in chunk_df_out.columns if c not in pipeline_cols]
                 ordered_cols = pipeline_cols + sorted(other_cols)
@@ -877,7 +1130,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     )
                     first_write = False
 
-                # Also save to checkpoint
                 if self.checkpoint_mgr:
                     self.checkpoint_mgr.append_output(
                         chunk_df_out,
@@ -886,11 +1138,9 @@ Respond in JSON: {{"rewritten": "..."}}"""
 
                 total_output_count += len(chunk_output)
 
-            # Mark chunk as completed
             completed_chunks.append(chunk_idx)
-            completed_rounds_in_chunk = []  # Reset for next chunk
+            completed_rounds_in_chunk = []
 
-            # Update checkpoint
             if self.checkpoint_mgr:
                 self.checkpoint_mgr.save_state(
                     completed_chunks=completed_chunks,
@@ -902,7 +1152,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                     completed_rounds_in_chunk=[],
                 )
 
-            # Update global lookup for cross-chunk references
             for round_config in rounds:
                 round_name = round_config["name"]
                 if round_name in chunk_texts_lookup:
@@ -920,7 +1169,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
         print(f"\n✅ Pipeline complete! Generated {total_output_count} total texts.")
         print(f"📋 Preserved columns: {self.metadata_columns}")
 
-        # Clear checkpoint on successful completion
         if self.checkpoint_mgr:
             print("🧹 Clearing checkpoint files (pipeline completed successfully)")
             self.checkpoint_mgr.clear()
@@ -937,7 +1185,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
         text_column: str = "text",
         resume: bool = True,
     ) -> pd.DataFrame:
-        """Standard pipeline entry point with automatic chunking for large datasets."""
         chunk_size = config.get("pipeline", {}).get("chunk_size", 50000)
 
         if len(input_df) > chunk_size:
@@ -955,7 +1202,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
                 resume=resume,
             )
 
-        # For smaller datasets, still use chunked but with full dataset as one chunk
         output_folder = config.get("output", {}).get("output_folder", "./output")
         output_path = Path(output_folder) / "final_augmented_dataset.csv"
         return self.run_pipeline_chunked(
@@ -968,13 +1214,11 @@ Respond in JSON: {{"rewritten": "..."}}"""
         )
 
     def get_live_results(self) -> Optional[pd.DataFrame]:
-        """Get current live results for inspection while pipeline is running."""
         if self.checkpoint_mgr:
             return self.checkpoint_mgr.load_live_results()
         return None
 
     def get_pipeline_status(self) -> Dict[str, Any]:
-        """Get current pipeline status including live results stats."""
         status = {
             "checkpoint_exists": False,
             "live_results": {"exists": False, "rows": 0},
@@ -991,7 +1235,6 @@ Respond in JSON: {{"rewritten": "..."}}"""
 
 
 def load_dataframe(file_path: str) -> pd.DataFrame:
-    """Load dataframe from various formats."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -1014,7 +1257,6 @@ def load_dataframe(file_path: str) -> pd.DataFrame:
 def load_dataframe_lazy(
     file_path: str, chunk_size: int = 10000
 ) -> Generator[pd.DataFrame, None, None]:
-    """Lazy load dataframe in chunks for very large files."""
     path = Path(file_path)
     ext = path.suffix.lower()
 
@@ -1031,17 +1273,7 @@ def load_dataframe_lazy(
         yield load_dataframe(file_path)
 
 
-# Utility function for inspecting live results from outside the pipeline
 def inspect_live_results(checkpoint_dir: str) -> Optional[pd.DataFrame]:
-    """
-    Load and inspect live results from a running or interrupted pipeline.
-
-    Args:
-        checkpoint_dir: Path to the checkpoint directory
-
-    Returns:
-        DataFrame with current live results, or None if no results exist
-    """
     live_file = Path(checkpoint_dir) / "live_results.csv"
     if live_file.exists():
         return pd.read_csv(live_file)
@@ -1049,15 +1281,6 @@ def inspect_live_results(checkpoint_dir: str) -> Optional[pd.DataFrame]:
 
 
 def get_checkpoint_status(checkpoint_dir: str) -> Dict[str, Any]:
-    """
-    Get status of a checkpoint without loading full data.
-
-    Args:
-        checkpoint_dir: Path to the checkpoint directory
-
-    Returns:
-        Dictionary with checkpoint status information
-    """
     checkpoint_path = Path(checkpoint_dir)
     state_file = checkpoint_path / "pipeline_state.json"
     live_file = checkpoint_path / "live_results.csv"
